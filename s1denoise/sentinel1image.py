@@ -27,20 +27,20 @@ class Sentinel1Image(Nansat):
     def __init__(self, filename, mapperName='sentinel1_l1', logLevel=30):
         ''' Read calibration/annotation XML files and auxiliary XML file '''
         Nansat.__init__( self, filename, mapperName=mapperName, logLevel=logLevel)
-        if ( self.filename.split('/')[-1][4:16]
+        if ( self.filename.split(os.sep)[-1][4:16]
              not in [ 'IW_GRDH_1SDH',
                       'IW_GRDH_1SDV',
                       'EW_GRDM_1SDH',
                       'EW_GRDM_1SDV'  ] ):
              raise ValueError( 'Source file must be Sentinel-1A/1B '
                  'IW_GRDH_1SDH, IW_GRDH_1SDV, EW_GRDM_1SDH, or EW_GRDM_1SDV product.' )
-        self.platform = self.filename.split('/')[-1][:3]    # S1A or S1B
-        self.obsMode = self.filename.split('/')[-1][4:6]    # IW or EW
+        self.platform = self.filename.split(os.sep)[-1][:3]    # S1A or S1B
+        self.obsMode = self.filename.split(os.sep)[-1][4:6]    # IW or EW
         pol_mode = os.path.basename(self.filename).split('_')[3]
         self.crosspol = {'1SDH': 'HV', '1SDV': 'VH'}[pol_mode]
         self.pols = {'1SDH': ['HH', 'HV'], '1SDV': ['VH', 'VV']}[pol_mode]
         self.swath_ids = range(1, {'IW':3, 'EW':5}[self.obsMode]+1)
-        txPol = self.filename.split('/')[-1][15]    # H or V
+        txPol = self.filename.split(os.sep)[-1][15]    # H or V
         self.annotationXML = {}
         self.calibrationXML = {}
         self.noiseXML = {}
@@ -114,45 +114,32 @@ class Sentinel1Image(Nansat):
 
     def set_aux_data_dir(self):
         """ Set directory where aux calibration data is stored """
-        self.aux_data_dir = os.path.join(os.environ.get('XDG_DATA_HOME', os.environ.get('HOME')),
+        self.aux_data_dir = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.expanduser('~')),
                                          '.s1denoise')
         if not os.path.exists(self.aux_data_dir):
             os.makedirs(self.aux_data_dir)
 
     def download_aux_calibration(self, filename, platform):
-        """ Download auxiliary calibration files form ESA in self.aux_data_dir """
-        cal_file = os.path.join(self.aux_data_dir, filename, 'data', '%s-aux-cal.xml' % platform)
-        if not os.path.exists(cal_file):
-            mission, prodtype, auxtype, validitystart, generationdate = filename.split('_') #S1A_AUX_CAL_V20171017T080000_G20201215T124601.SAFE -> ['S1A', 'AUX', 'CAL', 'V20171017T080000', 'G20201215T124601.SAFE']
-            yyyy, mm, dd = validitystart[1:5], validitystart[5:7], validitystart[7:9]
-            
-            # URL based off https://qc.sentinel1.groupcls.com/product/S1A/AUX_CAL/2017/10/17/S1A_AUX_CAL_V20171017T080000_G20201215T124601.SAFE.TGZ
-            cal_url = f'https://qc.sentinel1.groupcls.com/product/{mission}/{prodtype}_{auxtype}/{yyyy}/{mm}/{dd}/{filename}.TGZ'
-            try:
-                print('Trying to download calibration from: ', cal_url)
-                r = requests.get(cal_url, stream=True)
-            except:
-                print(cal_url, 'is not accessible')
-                cal_url = f'http://aux.sentinel1.eo.esa.int/AUX_CAL/{yyyy}/{mm}/{dd}/{filename}/data/s1a-aux-cal.xml'
-                print('Trying: ', cal_url)
-                r = requests.get(cal_url, stream=True)
-                gzipped = False
-                download_file = cal_file
-            else:
-                gzipped = True
-                download_file = os.path.join(self.aux_data_dir, filename + '.TGZ')
+        self.auxiliaryCalibration_file = os.path.join(self.aux_data_dir, filename, 'data', '%s-aux-cal.xml' % platform)
+        if os.path.exists(self.auxiliaryCalibration_file):
+            return
+        vs = filename.split('_')[3].lstrip('V')
+        validity_start = f'{vs[:4]}-{vs[4:6]}-{vs[6:8]}T{vs[9:11]}:{vs[11:13]}:{vs[13:15]}'
 
-            if r.status_code == 200:
-                with open(download_file, "wb") as f:
-                    f.write(r.content)
-                print('Download calibration file - success!')
-                if gzipped:
-                    subprocess.call(['tar', '-xzvf', download_file, '-C', self.aux_data_dir])
-            else:
-                print('Download calibration file - FAILED!')
-                raise Exception(f'Calibration file download failure - HTTP response code: {r.status_code}')
+        cd = filename.split('_')[4].lstrip('G')
+        creation_date = f'{cd[:4]}-{cd[4:6]}-{cd[6:8]}T{cd[9:11]}:{cd[11:13]}:{cd[13:15]}'
+        api_url = f'https://sar-mpc.eu/api/v1/?product_type=AUX_CAL&validity_start={validity_start}&creation_date={creation_date}'
+        with requests.get(api_url, stream=True) as r:
+            uuid = json.loads(r.content.decode())['results'][0]['uuid']
 
-        self.auxiliaryCalibration_file = cal_file
+        download_file = os.path.join(self.aux_data_dir, filename + '.zip')
+        aux_cal_url = f'https://sar-mpc.eu/download/{uuid}/'
+        print(f'downloading {filename}.zip from {aux_cal_url}')
+        with requests.get(aux_cal_url, stream=True) as r:
+            with open(download_file, "wb") as f:
+                f.write(r.content)
+
+        subprocess.call(['unzip', download_file, '-d', self.aux_data_dir])
 
     def get_noise_range_vectors(self, polarization):
         """ Get range noise from XML files and return noise, pixels and lines for non-zero elems"""
@@ -1027,7 +1014,7 @@ class Sentinel1Image(Nansat):
         extraScalingParameters = {}
         noiseVarianceParameters = {}
         IPFversion = float(self.IPFversion)
-        sensingDate = datetime.strptime(self.filename.split('/')[-1].split('_')[4], '%Y%m%dT%H%M%S')
+        sensingDate = datetime.strptime(self.filename.split(os.sep)[-1].split('_')[4], '%Y%m%dT%H%M%S')
         if platform=='S1B' and IPFversion==2.72 and sensingDate >= datetime(2017,1,16,13,42,34):
             # Adaption for special case.
             # ESA abrubtly changed scaling LUT in AUX_PP1 from 20170116 while keeping the IPFv.
@@ -1070,7 +1057,7 @@ class Sentinel1Image(Nansat):
         return ( noiseScalingParameters, powerBalancingParameters, extraScalingParameters,
                  noiseVarianceParameters )
 
-    def remove_texture_noise(self, polarization, window=3, weight=0.5, s0_min=0, remove_negative=True):
+    def remove_texture_noise(self, polarization, window=3, weight=0.5, s0_min=0, remove_negative=True, **kwargs):
         """ Thermal noise removal followed by textural noise compensation using Method2
 
         Method2 is implemented as a weighted average of sigma0 and sigma0 smoothed with
